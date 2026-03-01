@@ -8,6 +8,8 @@ import { makeColorTransparent } from '../utils/imageProcessing'
 const { t } = useI18n()
 const calibrationData = ref(null)
 const isLoading = ref(true)
+const previewImagePath = `${import.meta.env.BASE_URL}Bilder/battlepass-preview.png`
+
 
 const hasWorkspaceContent = ref(false)
 
@@ -75,7 +77,7 @@ onMounted(async () => {
           </div>
           <div class="header-preview">
             <div class="preview-tile">
-              <img src="/Bilder/battlepass-preview.png" alt="Battle Pass Preview" class="preview-image" />
+              <img :src="previewImagePath" alt="Battle Pass Preview" class="preview-image" />
               <div class="tile-badge">{{ t('battlepass.preview') }}</div>
             </div>
           </div>
@@ -95,13 +97,14 @@ onMounted(async () => {
 
 <style scoped>
 .editor-view {
-  min-height: 100vh;
+  flex: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
   padding: 2rem 1rem;
   max-width: 1200px;
   margin: 0 auto;
+  width: 100%;
 }
 
 .page-header {

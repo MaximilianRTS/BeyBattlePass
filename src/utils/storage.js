@@ -7,8 +7,8 @@ const DB_NAME = 'BattlepassPrinterDB'
 const DB_VERSION = 1
 const STORE_NAME = 'config'
 
-/** Path to the default template (no transparency) */
-export const DEFAULT_TEMPLATE_PATH = '/template.png'
+/** Path to the default template – BASE_URL handles local vs. GitHub Pages correctly */
+export const DEFAULT_TEMPLATE_PATH = `${import.meta.env.BASE_URL}template.png`
 
 /**
  * Default calibration matched to the bundled template.png (1024×282px).

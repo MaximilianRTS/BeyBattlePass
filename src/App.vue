@@ -14,12 +14,17 @@ import AppFooter from './components/AppFooter.vue'
 
 <style scoped>
 .battlepass-app {
-  min-height: 100vh;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   color: var(--color-text);
   background: var(--color-bg);
 }
 
 .battlepass-main {
+  flex: 1;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
 }
