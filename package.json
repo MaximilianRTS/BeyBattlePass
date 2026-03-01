@@ -1,0 +1,36 @@
+{
+    "name": "bey-battle-pass",
+    "version": "1.0.0",
+    "description": "Create and download custom Beyblade Battle Pass cutouts as printable PDFs. Upload images, position them on templates, and export high-quality prints.",
+    "author": "Maximilian Reitsberger (Maximilian RTS)",
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/MaximilianRTS/BeyBattlePass"
+    },
+    "keywords": [
+        "beyblade",
+        "battle-pass",
+        "vue3",
+        "pdf-generator",
+        "print-template"
+    ],
+    "type": "module",
+    "engines": {
+        "node": ">=18.0.0"
+    },
+    "scripts": {
+        "dev": "vite",
+        "build": "vite build",
+        "preview": "vite preview"
+    },
+    "dependencies": {
+        "jspdf": "^4.1.0",
+        "vue": "^3.5.24",
+        "vue-i18n": "^9.14.5"
+    },
+    "devDependencies": {
+        "@vitejs/plugin-vue": "^6.0.1",
+        "vite": "^7.2.4"
+    }
+}
