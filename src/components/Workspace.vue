@@ -24,15 +24,11 @@ const TARGET_WIDTH_MM = 111.55
 const TARGET_HEIGHT_MM = 25.64
 
 // State
-const uploadedImage = ref(null)
-const uploadedImageName = ref('')
-const imageScale = ref(1)
-const panX = ref(0)
-const panY = ref(0)
+const layers = ref([])
+const activeLayerId = ref(null)
 const isPanning = ref(false)
 const isExporting = ref(false)
 const showExportMenu = ref(false)
-const autoFitApplied = ref(false)
 
 /** Items to be rendered one below the other in PDF export. */
 const sessionItems = ref([])
@@ -46,50 +42,84 @@ const ITEM_GAP_MM = 5
 const pdfItemWidthMM = computed(() => props.calibration.printWidthMM ?? 111.6)
 const pdfItemHeightMM = computed(() => props.calibration.printHeightMM ?? 27)
 
+const activeLayer = computed(() => {
+  return layers.value.find(l => l.id === activeLayerId.value) || null
+})
+
 // Load saved workspace settings
 onMounted(async () => {
   const settings = await storage.loadWorkspaceSettings()
-  panX.value = settings.panX
-  panY.value = settings.panY
-  imageScale.value = settings.scale
+  if (settings.layers && settings.layers.length > 0) {
+    layers.value = settings.layers
+    activeLayerId.value = settings.activeLayerId || layers.value[0].id
+  }
 })
 
-// Auto-save workspace settings
-watch([panX, panY, imageScale], async () => {
+// Debounce helper for saving to IndexedDB to avoid lags during dragging
+function debounce(fn, delay) {
+  let timeout
+  return (...args) => {
+    clearTimeout(timeout)
+    timeout = setTimeout(() => fn(...args), delay)
+  }
+}
+
+const debouncedSave = debounce(async (layersVal, activeIdVal) => {
   await storage.saveWorkspaceSettings({
-    panX: panX.value,
-    panY: panY.value,
-    scale: imageScale.value
+    layers: JSON.parse(JSON.stringify(layersVal)),
+    activeLayerId: activeIdVal
   })
-}, { debounce: 500 })
+}, 500)
+
+// Auto-save workspace settings
+watch(layers, (newVal) => {
+  debouncedSave(newVal, activeLayerId.value)
+}, { deep: true })
+
+watch(activeLayerId, (newVal) => {
+  debouncedSave(layers.value, newVal)
+})
 
 // Emit content state
-watch([uploadedImage, sessionItems], ([img, items]) => {
-  emit('has-content', !!img || items.length > 0)
+watch([layers, sessionItems], ([lys, items]) => {
+  emit('has-content', lys.length > 0 || items.length > 0)
 }, { immediate: true, deep: true })
 
-// File upload
+// File upload: Add new image layer
 const handleFileUpload = (e) => {
   const target = e.target
   if (target.files && target.files[0]) {
     const file = target.files[0]
-    uploadedImageName.value = file.name
-    editingItemId.value = null
-    autoFitApplied.value = false
     const reader = new FileReader()
-    reader.onload = (e) => {
-      const dataUrl = e.target?.result
-      uploadedImage.value = dataUrl
+    reader.onload = (event) => {
+      const dataUrl = event.target?.result
+      if (!dataUrl) return
+      
+      const newLayer = {
+        id: crypto.randomUUID(),
+        type: 'image',
+        name: file.name.replace(/\.[^/.]+$/, ""), // clean extension
+        imageDataUrl: dataUrl,
+        scale: 1,
+        panX: 0,
+        panY: 0,
+        rotation: 0,
+        opacity: 1,
+        blendMode: 'normal',
+        visible: true
+      }
+      
+      layers.value.push(newLayer)
+      activeLayerId.value = newLayer.id
 
-      // Check if image matches template proportions
+      // Check if image matches template proportions and auto-fit if it does
       const img = new Image()
       img.onload = () => {
         const uploadedAspect = img.width / img.height
         const templateAspect = props.calibration.templateWidthMM / props.calibration.templateHeightMM
         const diff = Math.abs(uploadedAspect - templateAspect) / templateAspect
         if (diff < 0.02) {
-          fitToTemplate()
-          autoFitApplied.value = true
+          fitLayerToTemplate(newLayer)
         }
       }
       img.src = dataUrl
@@ -99,51 +129,104 @@ const handleFileUpload = (e) => {
   target.value = '' // allow re-selecting the same file
 }
 
-// Remove the uploaded image (return to upload view)
+// Drag & drop upload support
+const handleDragOver = (e) => {
+  e.preventDefault()
+}
+
+const handleDrop = (e) => {
+  e.preventDefault()
+  if (e.dataTransfer?.files && e.dataTransfer.files[0]) {
+    const file = e.dataTransfer.files[0]
+    if (file.type.startsWith('image/')) {
+      const reader = new FileReader()
+      reader.onload = (event) => {
+        const dataUrl = event.target?.result
+        if (!dataUrl) return
+        
+        const newLayer = {
+          id: crypto.randomUUID(),
+          type: 'image',
+          name: file.name.replace(/\.[^/.]+$/, ""),
+          imageDataUrl: dataUrl,
+          scale: 1,
+          panX: 0,
+          panY: 0,
+          rotation: 0,
+          opacity: 1,
+          blendMode: 'normal',
+          visible: true
+        }
+        layers.value.push(newLayer)
+        activeLayerId.value = newLayer.id
+        
+        const img = new Image()
+        img.onload = () => {
+          const uploadedAspect = img.width / img.height
+          const templateAspect = props.calibration.templateWidthMM / props.calibration.templateHeightMM
+          const diff = Math.abs(uploadedAspect - templateAspect) / templateAspect
+          if (diff < 0.02) {
+            fitLayerToTemplate(newLayer)
+          }
+        }
+        img.src = dataUrl
+      }
+      reader.readAsDataURL(file)
+    }
+  }
+}
+
+// Remove the uploaded images (return to upload view)
 const removeImage = () => {
-  uploadedImage.value = null
-  uploadedImageName.value = ''
+  layers.value = []
+  activeLayerId.value = null
   editingItemId.value = null
-  autoFitApplied.value = false
-  resetPosition()
 }
 
 /** Renders a masked slot DataURL from a PrintItem + calibration (without template overlay). */
 async function renderItemToMaskedDataUrl(item, calibration) {
-  // Load both images, using blob fetch for cross-origin template URLs
-  const [itemBlobUrl, templateBlobUrl] = await Promise.all([
-    loadImageAsBlob(item.imageDataUrl),
-    loadImageAsBlob(calibration.transparentTemplate)
-  ])
+  // Load template image
+  const templateBlobUrl = await loadImageAsBlob(calibration.transparentTemplate)
+
+  // Load all visible layers
+  const layersToDraw = item.layers || []
+  const loadedLayers = await Promise.all(
+    layersToDraw
+      .filter(layer => layer.visible && layer.imageDataUrl)
+      .map(async (layer) => {
+        try {
+          const blobUrl = await loadImageAsBlob(layer.imageDataUrl)
+          return { layer, blobUrl }
+        } catch (e) {
+          console.error('Failed to load layer image blob:', layer.name, e)
+          return { layer, blobUrl: layer.imageDataUrl }
+        }
+      })
+  )
 
   return new Promise((resolve, reject) => {
-    const img = new Image()
-    img.src = itemBlobUrl
-
     const templateImg = new Image()
     templateImg.src = templateBlobUrl
 
     const cleanup = () => {
-      if (itemBlobUrl !== item.imageDataUrl) URL.revokeObjectURL(itemBlobUrl)
-      if (templateBlobUrl !== calibration.transparentTemplate) URL.revokeObjectURL(templateBlobUrl)
+      if (templateBlobUrl !== calibration.transparentTemplate) {
+        URL.revokeObjectURL(templateBlobUrl)
+      }
+      loadedLayers.forEach(({ blobUrl, layer }) => {
+        if (blobUrl && blobUrl !== layer.imageDataUrl && blobUrl.startsWith('blob:')) {
+          URL.revokeObjectURL(blobUrl)
+        }
+      })
     }
 
-    const run = () => {
+    const run = (loadedImages) => {
       const tw = templateImg.width
       const th = templateImg.height
-      const aspect = img.width / img.height
 
       const cutoutLeftPx = (calibration.cutoutXMM / calibration.templateWidthMM) * tw
       const cutoutTopPx = (calibration.cutoutYMM / calibration.templateHeightMM) * th
       const cutoutWidthPx = (TARGET_WIDTH_MM / calibration.templateWidthMM) * tw
       const cutoutHeightPx = (TARGET_HEIGHT_MM / calibration.templateHeightMM) * th
-
-      const imgHeightPx = cutoutHeightPx * item.scale
-      const imgWidthPx = imgHeightPx * aspect
-      const centerXpx = cutoutLeftPx + (0.5 + item.panX) * cutoutWidthPx
-      const centerYpx = cutoutTopPx + (0.5 + item.panY) * cutoutHeightPx
-      const drawX = centerXpx - imgWidthPx / 2
-      const drawY = centerYpx - imgHeightPx / 2
 
       const canvas = document.createElement('canvas')
       canvas.width = tw
@@ -155,37 +238,123 @@ async function renderItemToMaskedDataUrl(item, calibration) {
         return
       }
 
+      ctx.clearRect(0, 0, tw, th)
+
       const useDefaultMask = isDefaultCalibration(calibration)
+
+      // 1. Draw layers
+      ctx.save()
       if (useDefaultMask) {
-        ctx.clearRect(0, 0, tw, th)
-        ctx.save()
+        ctx.beginPath()
         ctx.rect(cutoutLeftPx, cutoutTopPx, cutoutWidthPx, cutoutHeightPx)
         ctx.clip()
-        ctx.drawImage(img, drawX, drawY, imgWidthPx, imgHeightPx)
+      }
+
+      // Draw loaded layers in index order (bottom to top)
+      loadedImages.forEach(({ img, layer }) => {
+        ctx.save()
+
+        // Set opacity
+        ctx.globalAlpha = layer.opacity !== undefined ? layer.opacity : 1.0
+
+        // Set blend mode
+        if (layer.blendMode && layer.blendMode !== 'normal') {
+          ctx.globalCompositeOperation = getCanvasBlendMode(layer.blendMode)
+        } else {
+          ctx.globalCompositeOperation = 'source-over'
+        }
+
+        const aspect = img.width / img.height
+        const imgHeightPx = cutoutHeightPx * layer.scale
+        const imgWidthPx = imgHeightPx * aspect
+        const centerXpx = cutoutLeftPx + (0.5 + layer.panX) * cutoutWidthPx
+        const centerYpx = cutoutTopPx + (0.5 + layer.panY) * cutoutHeightPx
+
+        // Transform (Translate to center, Rotate, Draw offset)
+        ctx.translate(centerXpx, centerYpx)
+        if (layer.rotation) {
+          ctx.rotate((layer.rotation * Math.PI) / 180)
+        }
+        ctx.drawImage(img, -imgWidthPx / 2, -imgHeightPx / 2, imgWidthPx, imgHeightPx)
+
         ctx.restore()
-      } else {
-        ctx.clearRect(0, 0, tw, th)
-        ctx.drawImage(img, drawX, drawY, imgWidthPx, imgHeightPx)
+      })
+
+      ctx.restore()
+
+      // 2. Apply template mask for custom template
+      if (!useDefaultMask) {
+        ctx.save()
         ctx.globalCompositeOperation = 'destination-out'
         ctx.drawImage(templateImg, 0, 0, tw, th)
+        ctx.restore()
       }
 
       cleanup()
       resolve(canvas.toDataURL('image/png'))
     }
 
-    let done = false
-    const runWhenBoth = () => {
-      if (done || !img.complete || !templateImg.complete) return
-      done = true
-      run()
+    const loadedImages = []
+    let loadedCount = 0
+    const totalToLoad = loadedLayers.length + 1
+
+    const checkReady = () => {
+      loadedCount++
+      if (loadedCount === totalToLoad) {
+        const sortedImages = loadedLayers.map(({ layer }) => {
+          return loadedImages.find(item => item.layer.id === layer.id)
+        }).filter(Boolean)
+        
+        run(sortedImages)
+      }
     }
-    img.onload = runWhenBoth
-    img.onerror = () => { cleanup(); reject(new Error('Failed to load item image')) }
-    templateImg.onload = runWhenBoth
-    templateImg.onerror = () => { cleanup(); reject(new Error('Failed to load template')) }
-    if (img.complete && templateImg.complete) runWhenBoth()
+
+    templateImg.onload = checkReady
+    templateImg.onerror = () => { cleanup(); reject(new Error('Failed to load template image')) }
+
+    loadedLayers.forEach(({ layer, blobUrl }) => {
+      const img = new Image()
+      img.src = blobUrl
+      img.onload = () => {
+        loadedImages.push({ img, layer })
+        checkReady()
+      }
+      img.onerror = () => {
+        console.error('Failed to load layer image:', layer.name)
+        const emptyCanvas = document.createElement('canvas')
+        emptyCanvas.width = 1
+        emptyCanvas.height = 1
+        const dummyImg = new Image()
+        dummyImg.src = emptyCanvas.toDataURL()
+        dummyImg.onload = () => {
+          loadedImages.push({ img: dummyImg, layer })
+          checkReady()
+        }
+      }
+    })
+
+    if (totalToLoad === 1) {
+      templateImg.onload = () => run([])
+    }
   })
+}
+
+// Blend mode helper for HTML5 Canvas
+function getCanvasBlendMode(blendMode) {
+  switch (blendMode) {
+    case 'multiply': return 'multiply'
+    case 'screen': return 'screen'
+    case 'overlay': return 'overlay'
+    case 'darken': return 'darken'
+    case 'lighten': return 'lighten'
+    case 'color-dodge': return 'color-dodge'
+    case 'color-burn': return 'color-burn'
+    case 'hard-light': return 'hard-light'
+    case 'soft-light': return 'soft-light'
+    case 'difference': return 'difference'
+    case 'exclusion': return 'exclusion'
+    default: return 'source-over'
+  }
 }
 
 /**
@@ -351,7 +520,9 @@ async function renderCutoutPreview(item, calibration) {
 
 /** Add current image + position as entry to the list or update an existing item. */
 const addToSession = async () => {
-  if (!uploadedImage.value) return
+  if (layers.value.length === 0) return
+
+  const designName = layers.value.find(l => l.type === 'image')?.name || 'Design'
 
   if (editingItemId.value) {
     // Update existing item in-place
@@ -359,11 +530,8 @@ const addToSession = async () => {
     if (idx !== -1) {
       const updated = {
         ...sessionItems.value[idx],
-        imageDataUrl: uploadedImage.value,
-        imageName: uploadedImageName.value || 'Bild',
-        panX: panX.value,
-        panY: panY.value,
-        scale: imageScale.value,
+        layers: JSON.parse(JSON.stringify(layers.value)),
+        imageName: designName,
         previewDataUrl: null
       }
       try {
@@ -378,11 +546,8 @@ const addToSession = async () => {
     // Add new item
     const item = {
       id: crypto.randomUUID(),
-      imageDataUrl: uploadedImage.value,
-      imageName: uploadedImageName.value || 'Bild',
-      panX: panX.value,
-      panY: panY.value,
-      scale: imageScale.value,
+      layers: JSON.parse(JSON.stringify(layers.value)),
+      imageName: designName,
       previewDataUrl: null
     }
     try {
@@ -404,11 +569,8 @@ const removeItem = (id) => {
 }
 
 const editItem = (item) => {
-  uploadedImage.value = item.imageDataUrl
-  uploadedImageName.value = item.imageName
-  panX.value = item.panX
-  panY.value = item.panY
-  imageScale.value = item.scale
+  layers.value = JSON.parse(JSON.stringify(item.layers))
+  activeLayerId.value = layers.value[layers.value.length - 1]?.id || null
   editingItemId.value = item.id
 }
 
@@ -425,15 +587,12 @@ const clearSessionList = () => {
 /** Items for PDF: session list or current editor as a single item. */
 const itemsForPDF = computed(() => {
   if (sessionItems.value.length > 0) return sessionItems.value
-  if (uploadedImage.value)
+  if (layers.value.length > 0)
     return [
       {
         id: 'current',
-        imageDataUrl: uploadedImage.value,
-        imageName: uploadedImageName.value || 'Bild',
-        panX: panX.value,
-        panY: panY.value,
-        scale: imageScale.value
+        layers: JSON.parse(JSON.stringify(layers.value)),
+        imageName: layers.value.find(l => l.type === 'image')?.name || 'Design'
       }
     ]
   return []
@@ -501,31 +660,42 @@ const generatePDF = async () => {
 
 // SVG Export
 const exportSVG = async () => {
-  if (!uploadedImage.value) return
+  if (layers.value.length === 0) return
 
   isExporting.value = true
   showExportMenu.value = false
 
   try {
-    const img = new Image()
-    img.src = uploadedImage.value
+    const svgWidth = TARGET_WIDTH_MM * 10 // Scale for better resolution
+    const svgHeight = TARGET_HEIGHT_MM * 10
 
-    await new Promise((resolve) => {
-      img.onload = () => {
-        const aspect = img.width / img.height
-        const svgWidth = TARGET_WIDTH_MM * 10 // Scale for better resolution
-        const svgHeight = TARGET_HEIGHT_MM * 10
+    const svgLayers = []
+    
+    // Load and draw each visible layer
+    for (const layer of layers.value) {
+      if (!layer.visible) continue
+      
+      const aspect = await new Promise((resolve) => {
+        const img = new Image()
+        img.onload = () => resolve(img.width / img.height)
+        img.onerror = () => resolve(1)
+        img.src = layer.imageDataUrl
+      })
 
-        const drawHeight = svgHeight * imageScale.value
-        const drawWidth = drawHeight * aspect
+      const drawHeight = svgHeight * layer.scale
+      const drawWidth = drawHeight * aspect
 
-        const centerX = (0.5 + panX.value) * svgWidth
-        const centerY = (0.5 + panY.value) * svgHeight
+      const centerX = (0.5 + layer.panX) * svgWidth
+      const centerY = (0.5 + layer.panY) * svgHeight
 
-        const drawX = centerX - (drawWidth / 2)
-        const drawY = centerY - (drawHeight / 2)
+      const transformStr = `translate(${centerX}, ${centerY}) rotate(${layer.rotation || 0}) translate(${-drawWidth / 2}, ${-drawHeight / 2})`
+      const opacityStr = layer.opacity !== undefined && layer.opacity !== 1 ? ` opacity="${layer.opacity}"` : ''
+      const mixBlendModeStr = layer.blendMode && layer.blendMode !== 'normal' ? ` style="mix-blend-mode: ${layer.blendMode}"` : ''
 
-        const svg = `<?xml version="1.0" encoding="UTF-8"?>
+      svgLayers.push(`<image x="0" y="0" width="${drawWidth}" height="${drawHeight}" xlink:href="${layer.imageDataUrl}" transform="${transformStr}"${opacityStr}${mixBlendModeStr} preserveAspectRatio="xMidYMid slice"/>`)
+    }
+
+    const svg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
      width="${TARGET_WIDTH_MM}mm" height="${TARGET_HEIGHT_MM}mm"
      viewBox="0 0 ${svgWidth} ${svgHeight}">
@@ -535,23 +705,17 @@ const exportSVG = async () => {
     </clipPath>
   </defs>
   <g clip-path="url(#cutout)">
-    <image x="${drawX}" y="${drawY}" width="${drawWidth}" height="${drawHeight}"
-           xlink:href="${uploadedImage.value}"
-           preserveAspectRatio="xMidYMid slice"/>
+    ${svgLayers.join('\n    ')}
   </g>
 </svg>`
 
-        const blob = new Blob([svg], { type: 'image/svg+xml' })
-        const url = URL.createObjectURL(blob)
-        const a = document.createElement('a')
-        a.href = url
-        a.download = 'battlepass-cutout.svg'
-        a.click()
-        URL.revokeObjectURL(url)
-
-        resolve()
-      }
-    })
+    const blob = new Blob([svg], { type: 'image/svg+xml' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'battlepass-cutout.svg'
+    a.click()
+    URL.revokeObjectURL(url)
   } finally {
     isExporting.value = false
   }
@@ -559,82 +723,138 @@ const exportSVG = async () => {
 
 // PNG Export (high resolution)
 const exportPNG = async () => {
-  if (!uploadedImage.value) return
+  if (layers.value.length === 0) return
 
   isExporting.value = true
   showExportMenu.value = false
 
   try {
-    const img = new Image()
-    img.src = uploadedImage.value
+    // High resolution export (300 DPI equivalent)
+    const scale = 4
+    const canvasWidth = Math.round(TARGET_WIDTH_MM * 11.811 * scale) // mm to px at 300dpi
+    const canvasHeight = Math.round(TARGET_HEIGHT_MM * 11.811 * scale)
+
+    const canvas = document.createElement('canvas')
+    canvas.width = canvasWidth
+    canvas.height = canvasHeight
+
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    ctx.clearRect(0, 0, canvasWidth, canvasHeight)
+
+    // Create rounded clip path
+    const radius = 20 * scale
+    ctx.beginPath()
+    ctx.roundRect(0, 0, canvasWidth, canvasHeight, radius)
+    ctx.clip()
+
+    for (const layer of layers.value) {
+      if (!layer.visible) continue
+
+      const img = await new Promise((resolve) => {
+        const i = new Image()
+        i.onload = () => resolve(i)
+        i.onerror = () => resolve(null)
+        i.src = layer.imageDataUrl
+      })
+      if (!img) continue
+
+      ctx.save()
+      ctx.globalAlpha = layer.opacity !== undefined ? layer.opacity : 1
+      if (layer.blendMode && layer.blendMode !== 'normal') {
+        ctx.globalCompositeOperation = getCanvasBlendMode(layer.blendMode)
+      }
+
+      const aspect = img.width / img.height
+      const drawHeight = canvasHeight * layer.scale
+      const drawWidth = drawHeight * aspect
+
+      const centerX = (0.5 + layer.panX) * canvasWidth
+      const centerY = (0.5 + layer.panY) * canvasHeight
+
+      ctx.translate(centerX, centerY)
+      if (layer.rotation) {
+        ctx.rotate((layer.rotation * Math.PI) / 180)
+      }
+      ctx.drawImage(img, -drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight)
+      ctx.restore()
+    }
 
     await new Promise((resolve) => {
-      img.onload = () => {
-        // High resolution export (300 DPI equivalent)
-        const scale = 4
-        const canvasWidth = Math.round(TARGET_WIDTH_MM * 11.811 * scale) // mm to px at 300dpi
-        const canvasHeight = Math.round(TARGET_HEIGHT_MM * 11.811 * scale)
-
-        const canvas = document.createElement('canvas')
-        canvas.width = canvasWidth
-        canvas.height = canvasHeight
-
-        const ctx = canvas.getContext('2d')
-        if (!ctx) return
-
-        // Fill with transparency
-        ctx.clearRect(0, 0, canvasWidth, canvasHeight)
-
-        const aspect = img.width / img.height
-        const drawHeight = canvasHeight * imageScale.value
-        const drawWidth = drawHeight * aspect
-
-        const centerX = (0.5 + panX.value) * canvasWidth
-        const centerY = (0.5 + panY.value) * canvasHeight
-
-        const drawX = centerX - (drawWidth / 2)
-        const drawY = centerY - (drawHeight / 2)
-
-        // Create rounded clip path
-        const radius = 20 * scale
-        ctx.beginPath()
-        ctx.roundRect(0, 0, canvasWidth, canvasHeight, radius)
-        ctx.clip()
-
-        ctx.drawImage(img, drawX, drawY, drawWidth, drawHeight)
-
-        canvas.toBlob((blob) => {
-          if (blob) {
-            const url = URL.createObjectURL(blob)
-            const a = document.createElement('a')
-            a.href = url
-            a.download = 'battlepass-cutout.png'
-            a.click()
-            URL.revokeObjectURL(url)
-          }
-          resolve()
-        }, 'image/png')
-      }
+      canvas.toBlob((blob) => {
+        if (blob) {
+          const url = URL.createObjectURL(blob)
+          const a = document.createElement('a')
+          a.href = url
+          a.download = 'battlepass-cutout.png'
+          a.click()
+          URL.revokeObjectURL(url)
+        }
+        resolve()
+      }, 'image/png')
     })
   } finally {
     isExporting.value = false
   }
 }
 
-// Fit image width to template cutout width
-const fitToTemplate = () => {
+// Layer stack controls
+const moveLayerUp = (index) => {
+  if (index === layers.value.length - 1) return
+  const temp = layers.value[index]
+  layers.value[index] = layers.value[index + 1]
+  layers.value[index + 1] = temp
+}
+
+const moveLayerDown = (index) => {
+  if (index === 0) return
+  const temp = layers.value[index]
+  layers.value[index] = layers.value[index - 1]
+  layers.value[index - 1] = temp
+}
+
+const toggleLayerVisibility = (layer) => {
+  layer.visible = !layer.visible
+}
+
+const removeLayer = (id) => {
+  layers.value = layers.value.filter(l => l.id !== id)
+  if (activeLayerId.value === id) {
+    activeLayerId.value = layers.value[layers.value.length - 1]?.id || null
+  }
+}
+
+const selectLayer = (id) => {
+  activeLayerId.value = id
+}
+
+// Fit active layer width to template cutout width
+const fitLayerToTemplate = (layer) => {
+  if (!layer) return
   const cal = props.calibration
-  imageScale.value = cal.templateWidthMM / TARGET_WIDTH_MM
-  panX.value = cal.templateWidthMM / (2 * TARGET_WIDTH_MM) - cal.cutoutXMM / TARGET_WIDTH_MM - 0.5
-  panY.value = cal.templateHeightMM / (2 * TARGET_HEIGHT_MM) - cal.cutoutYMM / TARGET_HEIGHT_MM - 0.5
+  layer.scale = cal.templateWidthMM / TARGET_WIDTH_MM
+  layer.panX = cal.templateWidthMM / (2 * TARGET_WIDTH_MM) - cal.cutoutXMM / TARGET_WIDTH_MM - 0.5
+  layer.panY = cal.templateHeightMM / (2 * TARGET_HEIGHT_MM) - cal.cutoutYMM / TARGET_HEIGHT_MM - 0.5
+  layer.rotation = 0
+}
+
+const fitToTemplate = () => {
+  if (activeLayer.value) {
+    fitLayerToTemplate(activeLayer.value)
+  }
 }
 
 // Reset position
 const resetPosition = () => {
-  panX.value = 0
-  panY.value = 0
-  imageScale.value = 1
-  autoFitApplied.value = false
+  if (activeLayer.value) {
+    activeLayer.value.panX = 0
+    activeLayer.value.panY = 0
+    activeLayer.value.scale = 1
+    activeLayer.value.rotation = 0
+    activeLayer.value.opacity = 1
+    activeLayer.value.blendMode = 'normal'
+  }
 }
 
 // Pan Logic with improved sensitivity
@@ -644,10 +864,11 @@ const startPan = (e) => {
 }
 
 const onPan = (e) => {
-  if (!isPanning.value) return
+  if (!isPanning.value || !activeLayer.value) return
   const sensitivity = 0.002
-  panX.value += e.movementX * sensitivity
-  panY.value += e.movementY * sensitivity
+  const currentScale = activeLayer.value.scale || 1
+  activeLayer.value.panX += (e.movementX * sensitivity) / currentScale
+  activeLayer.value.panY += (e.movementY * sensitivity) / currentScale
 }
 
 const stopPan = () => {
@@ -657,8 +878,9 @@ const stopPan = () => {
 // Wheel zoom
 const handleWheel = (e) => {
   e.preventDefault()
+  if (!activeLayer.value) return
   const delta = e.deltaY > 0 ? -0.05 : 0.05
-  imageScale.value = Math.max(0.1, Math.min(10, imageScale.value + delta))
+  activeLayer.value.scale = Math.max(0.1, Math.min(10, activeLayer.value.scale + delta))
 }
 
 // Styles
@@ -679,30 +901,33 @@ const templateStyle = computed(() => ({
   maxWidth: 'none',
   maxHeight: 'none',
   pointerEvents: 'none',
-  zIndex: 10
+  zIndex: 90
 }))
 
-const userImageStyle = computed(() => ({
-  height: '100%',
-  position: 'absolute',
-  left: `${(0.5 + panX.value) * 100}%`,
-  top: `${(0.5 + panY.value) * 100}%`,
-  transform: `translate(-50%, -50%) scale(${imageScale.value})`,
-  transformOrigin: 'center',
-  userSelect: 'none',
-  pointerEvents: 'none',
-  zIndex: 1
-}))
+const getLayerStyle = (layer) => {
+  return {
+    height: '100%',
+    position: 'absolute',
+    left: `${(0.5 + layer.panX) * 100}%`,
+    top: `${(0.5 + layer.panY) * 100}%`,
+    transform: `translate(-50%, -50%) scale(${layer.scale}) rotate(${layer.rotation || 0}deg)`,
+    transformOrigin: 'center',
+    userSelect: 'none',
+    pointerEvents: 'none',
+    zIndex: layers.value.indexOf(layer) + 1,
+    mixBlendMode: layer.blendMode || 'normal'
+  }
+}
 </script>
 
 <template>
-  <div class="workspace">
+  <div class="workspace" @dragover="handleDragOver" @drop="handleDrop">
     <div class="workspace-header">
       <h2>{{ t('battlepass.workspace') }}</h2>
     </div>
 
-    <!-- Upload Section (nur wenn kein Bild UND keine Session-Items) -->
-    <div class="upload-section glass-panel" v-if="!uploadedImage && sessionItems.length === 0">
+    <!-- Upload Section (only when no layers exist and no designs are saved) -->
+    <div class="upload-section glass-panel" v-if="layers.length === 0 && sessionItems.length === 0">
       <div class="upload-content">
         <div class="upload-icon">
           <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -725,10 +950,11 @@ const userImageStyle = computed(() => ({
       </div>
     </div>
 
-    <!-- Editor Layout (Bild geladen ODER Session-Items vorhanden) -->
+    <!-- Editor Layout (Layers exist or designs exist) -->
     <div class="editor-layout" v-else>
-      <div class="preview-column">
-        <div class="preview-section" v-if="uploadedImage">
+      <template v-if="layers.length > 0">
+        <!-- TOP SECTION: Full-width Preview Viewport -->
+        <div class="preview-section">
           <div class="preview-header">
             <span class="preview-title">{{ t('battlepass.preview') }}</span>
             <span class="preview-hint">{{ t('battlepass.navigation_hint') }}</span>
@@ -743,7 +969,19 @@ const userImageStyle = computed(() => ({
             @mouseleave="stopPan"
             @wheel="handleWheel"
           >
-            <img :src="uploadedImage" :style="userImageStyle" draggable="false" alt="Uploaded image" />
+            <!-- Layer Images -->
+            <img 
+              v-for="layer in layers" 
+              :key="layer.id"
+              :src="layer.imageDataUrl" 
+              :style="getLayerStyle(layer)"
+              class="layer-img"
+              :class="{ 'active-layer': activeLayerId === layer.id }"
+              draggable="false"
+              alt="Layer image" 
+            />
+            
+            <!-- Template Overlay -->
             <img v-if="calibration.transparentTemplate" :src="calibration.transparentTemplate" :style="templateStyle" draggable="false" alt="Template overlay" />
 
             <!-- Grid overlay for alignment help -->
@@ -753,99 +991,233 @@ const userImageStyle = computed(() => ({
             <div class="crosshair"></div>
           </div>
 
-          <div class="preview-info">
-            <span>{{ t('battlepass.position') }}: {{ (panX * 100).toFixed(1) }}%, {{ (panY * 100).toFixed(1) }}%</span>
-            <span>{{ t('battlepass.zoom') }}: {{ Math.round(imageScale * 100) }}%</span>
-          </div>
-
-          <div class="auto-fit-hint" v-if="autoFitApplied">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M20 6L9 17l-5-5"/>
-            </svg>
-            {{ t('battlepass.autofit_hint') }}
+          <div class="preview-info" v-if="activeLayer">
+            <span>{{ t('battlepass.position') }}: {{ (activeLayer.panX * 100).toFixed(1) }}%, {{ (activeLayer.panY * 100).toFixed(1) }}%</span>
+            <span>{{ t('battlepass.zoom') }}: {{ Math.round(activeLayer.scale * 100) }}%</span>
           </div>
         </div>
 
-        <!-- Kompakter Upload-Bereich wenn kein Bild aber Session-Items vorhanden -->
-        <div class="upload-inline glass-panel" v-if="!uploadedImage && sessionItems.length > 0">
-          <div class="upload-inline-content">
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-              <polyline points="17 8 12 3 7 8"/>
-              <line x1="12" y1="3" x2="12" y2="15"/>
-            </svg>
-            <span>{{ t('battlepass.upload_next') }}</span>
-            <label class="btn btn-primary">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+
+        <!-- BOTTOM SECTION: Controls Grid (2 Columns) -->
+        <div class="editor-workspace-grid" style="margin-top: 1.5rem;">
+          <!-- LEFT COLUMN: Layers Stack & Inline Upload -->
+          <div class="viewport-column">
+          <!-- Layers Stack Manager -->
+          <div class="controls-card glass-panel layers-panel">
+            <h3>{{ t('battlepass.layers') }}</h3>
+            
+            <div class="layers-list">
+              <!-- Stack visual order: top of list is top layer (drawn last) -->
+              <div 
+                v-for="(layer, index) in [...layers].reverse()" 
+                :key="layer.id"
+                class="layer-item"
+                :class="{ 'active': activeLayerId === layer.id }"
+                @click="selectLayer(layer.id)"
+              >
+                <!-- Layer Thumbnail -->
+                <div class="layer-thumb">
+                  <img :src="layer.imageDataUrl" alt="Thumbnail" />
+                </div>
+                
+                <!-- Layer Info -->
+                <div class="layer-info">
+                  <input 
+                    type="text" 
+                    v-model="layer.name" 
+                    class="layer-name-input"
+                    @click.stop
+                    :title="t('battlepass.rename_layer')"
+                  />
+                  <span class="layer-meta">
+                    Scale: {{ Math.round(layer.scale * 100) }}% | {{ layer.blendMode }}
+                  </span>
+                </div>
+                
+                <!-- Layer Quick Actions -->
+                <div class="layer-actions" @click.stop>
+                  <!-- Visibility eye icon -->
+                  <button 
+                    class="btn btn-ghost btn-icon layer-btn" 
+                    @click="toggleLayerVisibility(layer)" 
+                    :title="t('battlepass.toggle_visibility')"
+                  >
+                    <svg v-if="layer.visible" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                      <circle cx="12" cy="12" r="3"/>
+                    </svg>
+                    <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+                      <line x1="1" y1="1" x2="23" y2="23"/>
+                    </svg>
+                  </button>
+                  
+                  <!-- Move Layer Up -->
+                  <button 
+                    class="btn btn-ghost btn-icon layer-btn" 
+                    @click="moveLayerUp(layers.length - 1 - index)" 
+                    :disabled="(layers.length - 1 - index) === layers.length - 1"
+                    :title="t('battlepass.move_up')"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <polyline points="18 15 12 9 6 15"/>
+                    </svg>
+                  </button>
+                  
+                  <!-- Move Layer Down -->
+                  <button 
+                    class="btn btn-ghost btn-icon layer-btn" 
+                    @click="moveLayerDown(layers.length - 1 - index)" 
+                    :disabled="(layers.length - 1 - index) === 0"
+                    :title="t('battlepass.move_down')"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <polyline points="6 9 12 15 18 9"/>
+                    </svg>
+                  </button>
+                  
+                  <!-- Delete Layer -->
+                  <button 
+                    class="btn btn-ghost btn-icon layer-btn btn-remove" 
+                    @click="removeLayer(layer.id)" 
+                    :title="t('battlepass.delete_layer')"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            </div>
+            
+            <div class="button-row">
+              <label class="btn btn-secondary btn-full">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 5v14M5 12h14"/>
+                </svg>
+                {{ t('battlepass.add_layer') }}
+                <input type="file" hidden accept="image/*" @change="handleFileUpload">
+              </label>
+            </div>
+          </div>
+
+          <!-- Inline Upload for adding more layers -->
+          <div class="upload-inline glass-panel">
+            <div class="upload-inline-content">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
                 <polyline points="17 8 12 3 7 8"/>
                 <line x1="12" y1="3" x2="12" y2="15"/>
               </svg>
-              {{ t('battlepass.select_file') }}
-              <input type="file" hidden accept="image/*" @change="handleFileUpload">
-            </label>
+              <span>{{ t('battlepass.add_layer') }}</span>
+              <label class="btn btn-primary">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="17 8 12 3 7 8"/>
+                  <line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+                {{ t('battlepass.select_file') }}
+                <input type="file" hidden accept="image/*" @change="handleFileUpload">
+              </label>
+            </div>
           </div>
-        </div>
+          </div>
 
-        <!-- Standalone Export wenn kein Bild aber Session-Items vorhanden -->
-        <div class="export-standalone glass-panel" v-if="!uploadedImage && sessionItems.length > 0">
-          <button class="btn btn-primary btn-large" @click="generatePDF" :disabled="isExporting">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-              <polyline points="14 2 14 8 20 8"/>
-              <line x1="16" y1="13" x2="8" y2="13"/>
-              <line x1="16" y1="17" x2="8" y2="17"/>
-              <polyline points="10 9 9 9 8 9"/>
-            </svg>
-            {{ t('battlepass.pdf_download') }} ({{ sessionItems.length }} {{ sessionItems.length === 1 ? 'Design' : 'Designs' }})
-          </button>
-        </div>
-
-        <!-- Bildeinstellungen & Export unter der Vorschau, gleiche Breite wie Vorschau -->
-        <div class="controls-below-preview" v-if="uploadedImage">
-          <div class="controls-card glass-panel">
-            <h3>{{ t('battlepass.image_settings') }}</h3>
+          <!-- RIGHT COLUMN: Active Layer Settings & Exports -->
+          <div class="controls-column">
+          <!-- Active Layer Settings Panel -->
+          <div class="controls-card glass-panel" v-if="activeLayer">
+            <h3>{{ t('battlepass.active_layer_settings') }}</h3>
+            <p class="selected-layer-name">Selected: <strong>{{ activeLayer.name }}</strong></p>
 
             <div class="control-group">
               <label>
                 <span>{{ t('battlepass.scale') }}</span>
-                <span class="value">{{ Math.round(imageScale * 100) }}%</span>
+                <span class="value">{{ Math.round(activeLayer.scale * 100) }}%</span>
               </label>
               <input
                 type="range"
                 min="0.1"
                 max="10"
                 step="0.01"
-                v-model.number="imageScale"
+                v-model.number="activeLayer.scale"
               >
             </div>
 
             <div class="control-group">
               <label>
                 <span>{{ t('battlepass.horizontal') }}</span>
-                <span class="value">{{ (panX * 100).toFixed(1) }}%</span>
+                <span class="value">{{ (activeLayer.panX * 100).toFixed(1) }}%</span>
               </label>
               <input
                 type="range"
                 min="-5"
                 max="5"
                 step="0.01"
-                v-model.number="panX"
+                v-model.number="activeLayer.panX"
               >
             </div>
 
             <div class="control-group">
               <label>
                 <span>{{ t('battlepass.vertical') }}</span>
-                <span class="value">{{ (panY * 100).toFixed(1) }}%</span>
+                <span class="value">{{ (activeLayer.panY * 100).toFixed(1) }}%</span>
               </label>
               <input
                 type="range"
                 min="-5"
                 max="5"
                 step="0.01"
-                v-model.number="panY"
+                v-model.number="activeLayer.panY"
               >
+            </div>
+
+            <div class="control-group">
+              <label>
+                <span>{{ t('battlepass.rotation') }}</span>
+                <span class="value">{{ activeLayer.rotation || 0 }}°</span>
+              </label>
+              <input
+                type="range"
+                min="-180"
+                max="180"
+                step="1"
+                v-model.number="activeLayer.rotation"
+              >
+            </div>
+
+            <div class="control-group">
+              <label>
+                <span>{{ t('battlepass.opacity') }}</span>
+                <span class="value">{{ Math.round((activeLayer.opacity ?? 1) * 100) }}%</span>
+              </label>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                v-model.number="activeLayer.opacity"
+              >
+            </div>
+
+            <div class="control-group">
+              <label>
+                <span>{{ t('battlepass.blend_mode') }}</span>
+              </label>
+              <select v-model="activeLayer.blendMode" class="blend-mode-select">
+                <option value="normal">{{ t('battlepass.normal') }}</option>
+                <option value="multiply">{{ t('battlepass.multiply') }}</option>
+                <option value="screen">{{ t('battlepass.screen') }}</option>
+                <option value="overlay">{{ t('battlepass.overlay') }}</option>
+                <option value="darken">{{ t('battlepass.darken') }}</option>
+                <option value="lighten">{{ t('battlepass.lighten') }}</option>
+                <option value="color-dodge">{{ t('battlepass.color_dodge') }}</option>
+                <option value="color-burn">{{ t('battlepass.color_burn') }}</option>
+                <option value="hard-light">{{ t('battlepass.hard_light') }}</option>
+                <option value="soft-light">{{ t('battlepass.soft_light') }}</option>
+                <option value="difference">{{ t('battlepass.difference') }}</option>
+                <option value="exclusion">{{ t('battlepass.exclusion') }}</option>
+              </select>
             </div>
 
             <div class="button-row">
@@ -859,6 +1231,7 @@ const userImageStyle = computed(() => ({
                 {{ t('battlepass.cancel') }}
               </button>
             </div>
+            
             <div class="button-row">
               <button class="btn btn-secondary" @click="fitToTemplate" :title="t('battlepass.fit_to_template')">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -874,26 +1247,18 @@ const userImageStyle = computed(() => ({
                 {{ t('battlepass.reset') }}
               </button>
             </div>
-            <div class="button-row">
-              <label class="btn btn-secondary" :title="t('battlepass.change_image')">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-                  <circle cx="9" cy="9" r="2"/>
-                  <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>
-                </svg>
-                {{ t('battlepass.change_image') }}
-                <input type="file" hidden accept="image/*" @change="handleFileUpload">
-              </label>
 
-              <button class="btn btn-secondary btn-remove" @click="removeImage" :title="t('battlepass.remove_image')">
+            <div class="button-row">
+              <button class="btn btn-secondary btn-remove" @click="removeLayer(activeLayer.id)" :title="t('battlepass.delete_layer')">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>
                 </svg>
-                {{ t('battlepass.remove_image') }}
+                {{ t('battlepass.delete_layer') }}
               </button>
             </div>
           </div>
 
+          <!-- Exports Panel -->
           <div class="export-card glass-panel">
             <h3>{{ t('battlepass.export') }}</h3>
 
@@ -938,60 +1303,90 @@ const userImageStyle = computed(() => ({
               <strong>PNG/SVG:</strong> {{ t('battlepass.png_svg_hint') }}
             </p>
           </div>
+          </div>
+        </div>
+      </template>
+
+      <!-- Next-Upload / Standalone Export State (when layers are empty but session items exist) -->
+      <template v-else>
+        <div class="upload-inline glass-panel" style="margin-bottom: 1.5rem;">
+          <div class="upload-inline-content">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+            <span>{{ t('battlepass.upload_next') }}</span>
+            <label class="btn btn-primary">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              {{ t('battlepass.select_file') }}
+              <input type="file" hidden accept="image/*" @change="handleFileUpload">
+            </label>
+          </div>
         </div>
 
-        <!-- Deine Designs -->
-        <div class="session-list-card glass-panel" v-if="sessionItems.length > 0">
-          <div class="session-list-header">
-            <h3>{{ t('battlepass.your_designs') }} ({{ sessionItems.length }})</h3>
-            <button class="btn btn-ghost btn-small btn-danger-ghost" @click="clearSessionList" :title="t('battlepass.delete_all')">
-              {{ t('battlepass.delete_all') }}
-            </button>
-          </div>
-          <div class="session-grid">
-            <div
-              v-for="(item, index) in sessionItems"
-              :key="item.id"
-              class="session-card"
-              :class="{ 'is-editing': editingItemId === item.id }"
-            >
-              <div class="session-card-preview">
-                <img :src="item.previewDataUrl || item.imageDataUrl" :alt="item.imageName" />
-                <span v-if="editingItemId === item.id" class="editing-badge">{{ t('battlepass.being_edited') }}</span>
-              </div>
-              <div class="session-card-footer">
-                <span class="session-card-name">{{ index + 1 }}. {{ item.imageName }}</span>
-                <div class="session-card-actions">
-                  <button
-                    class="btn btn-ghost btn-icon"
-                    @click="editItem(item)"
-                    :title="t('battlepass.edit')"
-                    :disabled="editingItemId === item.id"
-                  >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-                    </svg>
-                  </button>
-                  <button class="btn btn-ghost btn-icon btn-remove" @click="removeItem(item.id)" :title="t('battlepass.delete')">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>
-                    </svg>
-                  </button>
-                </div>
+        <div class="export-standalone glass-panel" style="margin-bottom: 1.5rem; display: flex; justify-content: center;">
+          <button class="btn btn-primary btn-large" @click="generatePDF" :disabled="isExporting">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+              <line x1="16" y1="13" x2="8" y2="13"/>
+              <line x1="16" y1="17" x2="8" y2="17"/>
+              <polyline points="10 9 9 9 8 9"/>
+            </svg>
+            {{ t('battlepass.pdf_download') }} ({{ sessionItems.length }} {{ sessionItems.length === 1 ? 'Design' : 'Designs' }})
+          </button>
+        </div>
+      </template>
+    </div>
+
+    <!-- Standalone PDF Download / Designs List (always at the bottom if designs exist) -->
+    <div class="designs-section-container" v-if="sessionItems.length > 0" style="margin-top: 2rem; width: 100%;">
+      <!-- Saved Designs Card -->
+      <div class="session-list-card glass-panel">
+        <div class="session-list-header">
+          <h3>{{ t('battlepass.your_designs') }} ({{ sessionItems.length }})</h3>
+          <button class="btn btn-ghost btn-small btn-danger-ghost" @click="clearSessionList" :title="t('battlepass.delete_all')">
+            {{ t('battlepass.delete_all') }}
+          </button>
+        </div>
+        <div class="session-grid">
+          <div
+            v-for="(item, index) in sessionItems"
+            :key="item.id"
+            class="session-card"
+            :class="{ 'is-editing': editingItemId === item.id }"
+          >
+            <div class="session-card-preview">
+              <img :src="item.previewDataUrl || (item.layers && item.layers[0]?.imageDataUrl)" :alt="item.imageName" />
+              <span v-if="editingItemId === item.id" class="editing-badge">{{ t('battlepass.being_edited') }}</span>
+            </div>
+            <div class="session-card-footer">
+              <span class="session-card-name">{{ index + 1 }}. {{ item.imageName }}</span>
+              <div class="session-card-actions">
+                <button
+                  class="btn btn-ghost btn-icon"
+                  @click="editItem(item)"
+                  :title="t('battlepass.edit')"
+                  :disabled="editingItemId === item.id"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                  </svg>
+                </button>
+                <button class="btn btn-ghost btn-icon btn-remove" @click="removeItem(item.id)" :title="t('battlepass.delete')">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>
+                  </svg>
+                </button>
               </div>
             </div>
           </div>
-        </div>
-
-        <!-- Current file info -->
-        <div class="file-info glass-panel" v-if="uploadedImageName">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-            <circle cx="9" cy="9" r="2"/>
-            <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>
-          </svg>
-          <span class="filename">{{ uploadedImageName }}</span>
         </div>
       </div>
     </div>
@@ -1005,10 +1400,6 @@ const userImageStyle = computed(() => ({
 </template>
 
 <style scoped>
-.workspace {
-  width: 100%;
-  max-width: 1100px;
-}
 
 .workspace-header {
   display: flex;
@@ -1067,7 +1458,7 @@ const userImageStyle = computed(() => ({
   font-size: 0.9rem;
 }
 
-/* Inline Upload (kompakt, wenn Session-Items vorhanden) */
+/* Inline Upload */
 .upload-inline {
   padding: 2rem;
 }
@@ -1085,41 +1476,44 @@ const userImageStyle = computed(() => ({
   font-size: 0.9rem;
 }
 
-/* Standalone Export (kein Bild, aber Session-Items) */
+/* Standalone Export */
 .export-standalone {
   display: flex;
   justify-content: center;
 }
 
-/* Editor Layout */
+/* Layout Grid System */
 .editor-layout {
   display: flex;
   flex-direction: column;
   width: 100%;
-  max-width: 100%;
 }
 
-.preview-column {
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-  min-width: 0;
-  width: 100%;
-}
-
-/* Bildeinstellungen & Export unter der Vorschau */
-.controls-below-preview {
+.editor-workspace-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1rem;
+  grid-template-columns: 1.3fr 1fr;
+  gap: 1.5rem;
   width: 100%;
-  min-width: 0;
 }
 
-@media (max-width: 600px) {
-  .controls-below-preview {
+@media (max-width: 900px) {
+  .editor-workspace-grid {
     grid-template-columns: 1fr;
   }
+}
+
+.viewport-column {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.controls-column {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 0;
 }
 
 /* Preview Section */
@@ -1150,8 +1544,9 @@ const userImageStyle = computed(() => ({
 
 /* Aspect Ratio ~4.35:1 (111.55/25.64) */
 .preview-viewport {
-  min-height: 180px;
-  max-height: min(60vh, 100vw / 4.35);
+  position: relative;
+  aspect-ratio: 111.55 / 25.64;
+  width: 100%;
   max-width: 100%;
   background-color: #1a1a1a;
   background-image:
@@ -1165,6 +1560,17 @@ const userImageStyle = computed(() => ({
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), inset 0 0 0 1px rgba(255, 255, 255, 0.1);
 }
 
+.layer-img {
+  width: auto !important;
+  max-width: none !important;
+  max-height: none !important;
+}
+
+img.active-layer {
+  outline: 2px dashed var(--color-primary);
+  outline-offset: -2px;
+}
+
 .preview-info {
   display: flex;
   justify-content: space-between;
@@ -1173,24 +1579,12 @@ const userImageStyle = computed(() => ({
   font-family: monospace;
 }
 
-.auto-fit-hint {
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-  font-size: 0.8rem;
-  color: #00c864;
-  padding: 0.4rem 0.75rem;
-  background: rgba(0, 200, 100, 0.1);
-  border-radius: 6px;
-  border: 1px solid rgba(0, 200, 100, 0.2);
-}
-
 /* Grid overlay */
 .grid-overlay {
   position: absolute;
   inset: 0;
   pointer-events: none;
-  z-index: 5;
+  z-index: 85;
   opacity: 0.1;
   background-image:
     linear-gradient(rgba(255, 255, 255, 0.3) 1px, transparent 1px),
@@ -1207,7 +1601,7 @@ const userImageStyle = computed(() => ({
   width: 24px;
   height: 24px;
   pointer-events: none;
-  z-index: 15;
+  z-index: 95;
 }
 
 .crosshair::before,
@@ -1233,6 +1627,7 @@ const userImageStyle = computed(() => ({
   transform: translateY(-50%);
 }
 
+/* Controls Panel */
 .controls-card h3,
 .export-card h3 {
   margin: 0 0 1rem;
@@ -1241,6 +1636,13 @@ const userImageStyle = computed(() => ({
   color: #aaa;
   text-transform: uppercase;
   letter-spacing: 0.5px;
+}
+
+.selected-layer-name {
+  font-size: 0.8rem;
+  color: #888;
+  margin-top: -0.5rem;
+  margin-bottom: 1rem;
 }
 
 .control-group {
@@ -1283,6 +1685,22 @@ const userImageStyle = computed(() => ({
   transform: scale(1.2);
 }
 
+.blend-mode-select {
+  width: 100%;
+  background: #1e1e24;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  color: #fff;
+  padding: 0.5rem;
+  font-size: 0.85rem;
+  outline: none;
+  cursor: pointer;
+}
+
+.blend-mode-select:focus {
+  border-color: var(--color-primary);
+}
+
 .button-row {
   display: flex;
   gap: 0.5rem;
@@ -1291,6 +1709,126 @@ const userImageStyle = computed(() => ({
 
 .button-row .btn {
   flex: 1;
+}
+
+.btn-full {
+  width: 100%;
+}
+
+/* Layers Stack Manager */
+.layers-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.layers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-height: 250px;
+  overflow-y: auto;
+  padding-right: 0.25rem;
+  margin-bottom: 0.5rem;
+}
+
+.layer-item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 0.5rem;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.layer-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
+.layer-item.active {
+  background: rgba(100, 108, 255, 0.1);
+  border-color: var(--color-primary);
+}
+
+.layer-thumb {
+  width: 40px;
+  height: 40px;
+  border-radius: 4px;
+  background: #111;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  flex-shrink: 0;
+}
+
+.layer-thumb img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.layer-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 0.2rem;
+}
+
+.layer-name-input {
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid transparent;
+  color: #fff;
+  font-size: 0.85rem;
+  font-weight: 500;
+  padding: 0;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.layer-name-input:focus {
+  outline: none;
+  border-color: var(--color-primary);
+}
+
+.layer-meta {
+  font-size: 0.7rem;
+  color: #666;
+}
+
+.layer-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
+}
+
+.layer-btn {
+  padding: 0.3rem;
+  border-radius: 4px;
+  opacity: 0.6;
+}
+
+.layer-btn:hover:not(:disabled) {
+  opacity: 1;
+}
+
+.layer-btn:disabled {
+  opacity: 0.25;
+}
+
+.no-layers-placeholder {
+  text-align: center;
+  padding: 2rem 1rem;
+  color: #666;
+  font-size: 0.9rem;
 }
 
 /* Export Section */
@@ -1316,7 +1854,7 @@ const userImageStyle = computed(() => ({
   line-height: 1.5;
 }
 
-/* Deine Designs */
+/* Saved Designs list */
 .session-list-card {
   width: 100%;
 }
@@ -1519,7 +2057,7 @@ const userImageStyle = computed(() => ({
   align-items: center;
   justify-content: center;
   gap: 1rem;
-  z-index: 100;
+  z-index: 150;
   backdrop-filter: blur(4px);
 }
 
