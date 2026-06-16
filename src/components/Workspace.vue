@@ -799,6 +799,117 @@ const exportPNG = async () => {
   }
 }
 
+// Export/Import Project Logic
+const handleExportProject = () => {
+  try {
+    const projectData = {
+      fileType: 'beytagger-project',
+      version: 1,
+      layers: JSON.parse(JSON.stringify(layers.value)),
+      sessionItems: JSON.parse(JSON.stringify(sessionItems.value))
+    }
+    
+    const jsonString = JSON.stringify(projectData)
+    const blob = new Blob([jsonString], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    
+    const now = new Date()
+    const ts = [
+      now.getFullYear(),
+      String(now.getMonth() + 1).padStart(2, '0'),
+      String(now.getDate()).padStart(2, '0'),
+      '-',
+      String(now.getHours()).padStart(2, '0'),
+      String(now.getMinutes()).padStart(2, '0')
+    ].join('')
+    const filename = `beytagger-project-${ts}.json`
+    
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
+  } catch (error) {
+    console.error('Failed to export project:', error)
+    alert('Error exporting project')
+  }
+}
+
+const handleImportProject = (e) => {
+  const target = e.target
+  if (target.files && target.files[0]) {
+    const file = target.files[0]
+    const reader = new FileReader()
+    reader.onload = async (event) => {
+      try {
+        const content = event.target?.result
+        if (!content || typeof content !== 'string') {
+          throw new Error('Empty or invalid file content')
+        }
+        
+        const projectData = JSON.parse(content)
+        
+        if (projectData.fileType !== 'beytagger-project') {
+          throw new Error('Not a valid Beytagger project file')
+        }
+        
+        // Restore layers
+        if (Array.isArray(projectData.layers)) {
+          layers.value = projectData.layers
+        } else {
+          layers.value = []
+        }
+        
+        // Restore session items
+        if (Array.isArray(projectData.sessionItems)) {
+          const items = []
+          for (const item of projectData.sessionItems) {
+            const restoredItem = {
+              id: item.id || crypto.randomUUID(),
+              layers: item.layers || [],
+              imageName: item.imageName || 'Design',
+              previewDataUrl: item.previewDataUrl || null
+            }
+            if (!restoredItem.previewDataUrl && restoredItem.layers.length > 0) {
+              try {
+                restoredItem.previewDataUrl = await renderCutoutPreview(restoredItem, props.calibration)
+              } catch (err) {
+                console.error('Failed to generate preview for imported design:', err)
+              }
+            }
+            items.push(restoredItem)
+          }
+          sessionItems.value = items
+        } else {
+          sessionItems.value = []
+        }
+        
+        // Reset active layer if any
+        if (layers.value.length > 0) {
+          activeLayerId.value = layers.value[layers.value.length - 1].id
+        } else {
+          activeLayerId.value = null
+        }
+        
+        editingItemId.value = null
+        
+        // Save to indexedDB workspace settings immediately
+        await storage.saveWorkspaceSettings({
+          layers: JSON.parse(JSON.stringify(layers.value)),
+          activeLayerId: activeLayerId.value
+        })
+        
+        alert(t('battlepass.import_success'))
+      } catch (error) {
+        console.error('Failed to import project:', error)
+        alert(t('battlepass.import_error'))
+      }
+    }
+    reader.readAsText(file)
+  }
+  target.value = '' // Reset input
+}
+
 // Layer stack controls
 const moveLayerUp = (index) => {
   if (index === layers.value.length - 1) return
@@ -924,6 +1035,30 @@ const getLayerStyle = (layer) => {
   <div class="workspace" @dragover="handleDragOver" @drop="handleDrop">
     <div class="workspace-header">
       <h2>{{ t('battlepass.workspace') }}</h2>
+      <div class="project-actions">
+        <label class="btn btn-secondary btn-small" :title="t('battlepass.import_project_title')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          {{ t('battlepass.import_project') }}
+          <input type="file" hidden accept=".json" @change="handleImportProject">
+        </label>
+        <button
+          class="btn btn-secondary btn-small"
+          :disabled="layers.length === 0 && sessionItems.length === 0"
+          @click="handleExportProject"
+          :title="t('battlepass.export_project_title')"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          {{ t('battlepass.export_project') }}
+        </button>
+      </div>
     </div>
 
     <!-- Upload Section (only when no layers exist and no designs are saved) -->
@@ -938,15 +1073,27 @@ const getLayerStyle = (layer) => {
         </div>
         <h3>{{ t('battlepass.upload_image') }}</h3>
         <p>{{ t('battlepass.drag_drop') }}</p>
-        <label class="btn btn-primary">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-            <polyline points="17 8 12 3 7 8"/>
-            <line x1="12" y1="3" x2="12" y2="15"/>
-          </svg>
-          {{ t('battlepass.select_file') }}
-          <input type="file" hidden accept="image/*" @change="handleFileUpload">
-        </label>
+        <div class="upload-buttons" style="display: flex; gap: 1rem; margin-top: 0.5rem; flex-wrap: wrap; justify-content: center;">
+          <label class="btn btn-primary">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+            {{ t('battlepass.select_file') }}
+            <input type="file" hidden accept="image/*" @change="handleFileUpload">
+          </label>
+          
+          <label class="btn btn-secondary" :title="t('battlepass.import_project_title')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            {{ t('battlepass.import_project') }}
+            <input type="file" hidden accept=".json" @change="handleImportProject">
+          </label>
+        </div>
       </div>
     </div>
 
@@ -2072,5 +2219,11 @@ img.active-layer {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+.project-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
 }
 </style>

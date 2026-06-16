@@ -83,7 +83,13 @@
         "add_layer_title": "Añadir una nueva capa de imagen al lienzo",
         "rename_layer": "Doble clic para renombrar",
         "delete_layer": "Eliminar Capa",
-        "toggle_visibility": "Alternar Visibilidad"
+        "toggle_visibility": "Alternar Visibilidad",
+        "export_project": "Exportar Proyecto",
+        "import_project": "Importar Proyecto",
+        "export_project_title": "Guardar todo el área de trabajo y diseños de forma local",
+        "import_project_title": "Cargar un proyecto previamente guardado",
+        "import_success": "¡Proyecto importado con éxito!",
+        "import_error": "Error al importar el archivo. Asegúrate de que sea un archivo de proyecto válido de Beytagger."
     },
     "footer": {
         "open_source": "Código abierto en GitHub",

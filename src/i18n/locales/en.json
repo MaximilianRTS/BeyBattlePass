@@ -83,7 +83,13 @@
         "add_layer_title": "Add a new image layer to the canvas",
         "rename_layer": "Double click to rename",
         "delete_layer": "Delete Layer",
-        "toggle_visibility": "Toggle Visibility"
+        "toggle_visibility": "Toggle Visibility",
+        "export_project": "Export Project",
+        "import_project": "Import Project",
+        "export_project_title": "Save the workspace and all designs locally",
+        "import_project_title": "Load a previously saved project",
+        "import_success": "Project imported successfully!",
+        "import_error": "Error importing file. Make sure it is a valid Beytagger project file."
     },
     "footer": {
         "open_source": "Open Source on GitHub",

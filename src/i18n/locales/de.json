@@ -83,7 +83,13 @@
         "add_layer_title": "Füge dem Arbeitsbereich eine neue Bildebene hinzu",
         "rename_layer": "Doppelklick zum Umbenennen",
         "delete_layer": "Ebene löschen",
-        "toggle_visibility": "Sichtbarkeit umschalten"
+        "toggle_visibility": "Sichtbarkeit umschalten",
+        "export_project": "Projekt exportieren",
+        "import_project": "Projekt importieren",
+        "export_project_title": "Den Arbeitsbereich und alle Designs lokal speichern",
+        "import_project_title": "Ein zuvor gespeichertes Projekt laden",
+        "import_success": "Projekt erfolgreich importiert!",
+        "import_error": "Fehler beim Importieren der Datei. Stelle sicher, dass es sich um eine gültige Beytagger-Projektdatei handelt."
     },
     "footer": {
         "open_source": "Open Source auf GitHub",
