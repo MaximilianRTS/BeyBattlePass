@@ -88,6 +88,7 @@ const appVersion = '1.0.0'
 const languages = [
   { code: 'de', flag: '🇩🇪', label: 'Deutsch' },
   { code: 'en', flag: '🇬🇧', label: 'English' },
+  { code: 'es', flag: '🇪🇸', label: 'Español' },
 ]
 
 const setLocale = (code) => {
